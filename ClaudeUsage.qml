@@ -600,7 +600,7 @@ PluginComponent {
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
                     text: Math.round(utilization) + "%"
-                    font.pixelSize: 22
+                    font.pixelSize: 17
                     font.weight: Font.Bold
                     color: barColor
                 }
