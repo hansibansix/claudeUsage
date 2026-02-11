@@ -35,6 +35,8 @@ PluginComponent {
     property bool dataAvailable: false
     property string errorMessage: ""
     property bool loading: false
+    property int _refreshRetries: 0
+    readonly property int _maxRefreshRetries: 5
 
     property real fiveHourUtil: 0
     property string fiveHourReset: ""
@@ -71,28 +73,40 @@ PluginComponent {
         loading = false;
     }
 
-    // === Credential loading ===
-    Process {
-        id: credLoader
-        property string output: ""
-        command: ["cat", root.credentialsPath]
+    // === Refresh retry timer ===
+    Timer {
+        id: refreshRetryTimer
+        interval: 30000
+        running: false
+        repeat: false
+        onTriggered: root.loadUsage()
+    }
 
-        stdout: SplitParser {
-            onRead: line => { credLoader.output += line; }
+    function scheduleRetry() {
+        if (_refreshRetries < _maxRefreshRetries) {
+            _refreshRetries++;
+            console.warn("[claudeUsage] Scheduling retry " + _refreshRetries + "/" + _maxRefreshRetries + " in 30s");
+            refreshRetryTimer.restart();
         }
+    }
 
-        onExited: (exitCode) => {
-            if (exitCode !== 0 || !output) {
+    // === Credential loading (watches file for external changes) ===
+    FileView {
+        id: credentialsFile
+        path: root.credentialsPath
+        watchChanges: true
+
+        onLoaded: {
+            var content = credentialsFile.text();
+            if (!content) {
                 root.setError("No credentials file found\nRun 'claude' to log in");
-                output = "";
                 return;
             }
 
             try {
-                var oauth = JSON.parse(output).claudeAiOauth;
+                var oauth = JSON.parse(content).claudeAiOauth;
                 if (!oauth) {
                     root.setError("No OAuth credentials found");
-                    output = "";
                     return;
                 }
 
@@ -109,7 +123,15 @@ PluginComponent {
             } catch (e) {
                 root.setError("Failed to parse credentials");
             }
-            output = "";
+        }
+
+        onFileChanged: {
+            root.loading = true;
+            credentialsFile.reload();
+        }
+
+        onLoadFailed: {
+            root.setError("No credentials file found\nRun 'claude' to log in");
         }
     }
 
@@ -124,26 +146,40 @@ PluginComponent {
 
         onExited: (exitCode) => {
             if (exitCode !== 0 || !output) {
-                root.setError("Token refresh failed\nRun 'claude' to re-login");
+                console.warn("[claudeUsage] Token refresh failed: exitCode=" + exitCode + " output=" + (output || "(empty)"));
+                root.setError("Token refresh failed\nRetrying...");
+                root.scheduleRetry();
                 output = "";
                 return;
             }
 
             try {
                 var resp = JSON.parse(output);
+                if (resp.error) {
+                    console.warn("[claudeUsage] Token refresh error: " + resp.error + " - " + (resp.error_description || ""));
+                    root.setError("Token refresh failed\n" + (resp.error_description || "Retrying..."));
+                    root.scheduleRetry();
+                    output = "";
+                    return;
+                }
                 if (!resp.access_token) {
-                    root.setError("Token refresh failed");
+                    console.warn("[claudeUsage] Token refresh: no access_token in response");
+                    root.setError("Token refresh failed\nRetrying...");
+                    root.scheduleRetry();
                     output = "";
                     return;
                 }
 
+                root._refreshRetries = 0;
                 root.accessToken = resp.access_token;
                 root.refreshToken = resp.refresh_token || root.refreshToken;
                 root.expiresAt = Date.now() + (resp.expires_in * 1000);
                 root.saveCredentials();
                 root.fetchUsage();
             } catch (e) {
-                root.setError("Token refresh failed\nRun 'claude' to re-login");
+                console.warn("[claudeUsage] Token refresh parse error: " + e + " raw=" + output.substring(0, 200));
+                root.setError("Token refresh failed\nRetrying...");
+                root.scheduleRetry();
             }
             output = "";
         }
@@ -205,19 +241,24 @@ PluginComponent {
         onExited: (exitCode) => {
             root.loading = false;
             if (exitCode !== 0 || !output) {
-                root.setError("Failed to fetch usage data");
+                console.warn("[claudeUsage] Usage fetch failed: exitCode=" + exitCode + " output=" + (output || "(empty)"));
+                root.setError("Failed to fetch usage data\nRetrying...");
+                root.scheduleRetry();
                 output = "";
                 return;
             }
 
             try {
                 var resp = JSON.parse(output);
+                root._refreshRetries = 0;
                 root.applyUsageData(resp);
             } catch (e) {
                 if (output.indexOf("401") >= 0 || output.indexOf("Unauthorized") >= 0) {
                     root.refreshOAuthToken();
                 } else {
-                    root.setError("Failed to parse usage data");
+                    console.warn("[claudeUsage] Usage parse error: " + e + " raw=" + output.substring(0, 200));
+                    root.setError("Failed to parse usage data\nRetrying...");
+                    root.scheduleRetry();
                 }
             }
             output = "";
@@ -280,8 +321,7 @@ PluginComponent {
 
     function loadUsage() {
         loading = true;
-        credLoader.output = "";
-        credLoader.running = true;
+        credentialsFile.reload();
     }
 
     Timer {
@@ -289,7 +329,7 @@ PluginComponent {
         interval: root.refreshIntervalMinutes * 60 * 1000
         running: true
         repeat: true
-        onTriggered: root.loadUsage()
+        onTriggered: { root._refreshRetries = 0; root.loadUsage(); }
     }
 
     Component.onCompleted: root.loadUsage()
