@@ -11,7 +11,7 @@ A [DankMaterialShell](https://github.com/DankMaterialShell) bar widget that show
   - Weekly Opus / Sonnet model-specific limits
   - Extra usage spending ($used / $limit)
   - Plan info (type + tier)
-- **Color-coded** — green (< 50%), yellow (50-80%), red (> 80%)
+- **Color-coded** — uses your theme's primary/warning/error colors based on utilization (< 50%, 50-80%, > 80%)
 - **Auto-refresh** — polls the API on a configurable interval (default: 2 min)
 - **OAuth token refresh** — expired tokens are refreshed automatically
 - **Configurable** — toggle individual sections, choose which window to show in the pill

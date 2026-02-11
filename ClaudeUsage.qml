@@ -608,7 +608,7 @@ PluginComponent {
 
             UsageBar {
                 width: parent.width
-                utilization: parent.parent.parent.utilization
+                utilization: parent.parent.utilization
             }
         }
     }
