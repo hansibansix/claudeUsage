@@ -46,7 +46,7 @@ function formatResetDateTime(isoString) {
     var hrsStr = hrs < 10 ? "0" + hrs : "" + hrs;
     var minStr = mins < 10 ? "0" + mins : "" + mins;
 
-    return "Resets " + days[d.getDay()] + ", " + dayStr + "." + monthStr + "." +
+    return "Resets " + days[d.getDay()] + ", " + dayStr + "." + monthStr +
            " at " + hrsStr + ":" + minStr;
 }
 

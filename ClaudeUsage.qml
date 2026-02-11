@@ -37,6 +37,7 @@ PluginComponent {
     property bool loading: false
     property int _refreshRetries: 0
     readonly property int _maxRefreshRetries: 5
+    property bool _savingCredentials: false
 
     property real fiveHourUtil: 0
     property string fiveHourReset: ""
@@ -126,6 +127,10 @@ PluginComponent {
         }
 
         onFileChanged: {
+            if (root._savingCredentials) {
+                root._savingCredentials = false;
+                return;
+            }
             root.loading = true;
             credentialsFile.reload();
         }
@@ -190,6 +195,7 @@ PluginComponent {
             setError("No refresh token available\nRun 'claude' to log in");
             return;
         }
+        if (tokenRefresher.running) return;
 
         tokenRefresher.output = "";
         tokenRefresher.command = [
@@ -216,6 +222,7 @@ PluginComponent {
     }
 
     function saveCredentials() {
+        _savingCredentials = true;
         credSaver.jsonData = JSON.stringify({
             claudeAiOauth: {
                 accessToken: accessToken,
@@ -240,28 +247,35 @@ PluginComponent {
 
         onExited: (exitCode) => {
             root.loading = false;
-            if (exitCode !== 0 || !output) {
-                console.warn("[claudeUsage] Usage fetch failed: exitCode=" + exitCode + " output=" + (output || "(empty)"));
+
+            // Extract HTTP status code appended by curl -w
+            var idx = output.lastIndexOf("HTTP_STATUS:");
+            var httpCode = idx >= 0 ? parseInt(output.substring(idx + 12)) : 0;
+            var body = idx >= 0 ? output.substring(0, idx) : output;
+            output = "";
+
+            if (exitCode !== 0 || !body) {
+                console.warn("[claudeUsage] Usage fetch failed: exitCode=" + exitCode);
                 root.setError("Failed to fetch usage data\nRetrying...");
                 root.scheduleRetry();
-                output = "";
+                return;
+            }
+
+            if (httpCode === 401) {
+                console.warn("[claudeUsage] Usage fetch got 401, refreshing token");
+                root.refreshOAuthToken();
                 return;
             }
 
             try {
-                var resp = JSON.parse(output);
+                var resp = JSON.parse(body);
                 root._refreshRetries = 0;
                 root.applyUsageData(resp);
             } catch (e) {
-                if (output.indexOf("401") >= 0 || output.indexOf("Unauthorized") >= 0) {
-                    root.refreshOAuthToken();
-                } else {
-                    console.warn("[claudeUsage] Usage parse error: " + e + " raw=" + output.substring(0, 200));
-                    root.setError("Failed to parse usage data\nRetrying...");
-                    root.scheduleRetry();
-                }
+                console.warn("[claudeUsage] Usage parse error: " + e + " raw=" + body.substring(0, 200));
+                root.setError("Failed to parse usage data\nRetrying...");
+                root.scheduleRetry();
             }
-            output = "";
         }
     }
 
@@ -305,12 +319,13 @@ PluginComponent {
             setError("No access token");
             return;
         }
+        if (usageFetcher.running) return;
 
         usageFetcher.output = "";
         usageFetcher.command = [
             "curl", "-sS", "--connect-timeout", "10", "--max-time", "15",
+            "-w", "\nHTTP_STATUS:%{http_code}",
             "-H", "Accept: application/json",
-            "-H", "Content-Type: application/json",
             "-H", "Authorization: Bearer " + accessToken,
             "-H", "anthropic-beta: oauth-2025-04-20",
             "-H", "User-Agent: claude-code/2.0.32",
