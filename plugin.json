@@ -1,0 +1,16 @@
+{
+    "id": "claudeUsage",
+    "name": "Claude Usage",
+    "description": "Shows Claude Pro/Max plan usage in the DankBar",
+    "version": "1.0.0",
+    "author": "hansibansix",
+    "icon": "smart_toy",
+    "type": "widget",
+    "component": "./ClaudeUsage.qml",
+    "settings": "./ClaudeUsageSettings.qml",
+    "permissions": [
+        "settings_read",
+        "settings_write",
+        "process"
+    ]
+}
