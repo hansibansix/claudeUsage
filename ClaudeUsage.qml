@@ -54,17 +54,36 @@ PluginComponent {
     property real extraUsageUtil: 0
 
     // === Pill helpers ===
-    readonly property real _pillPct: displayMode === "7d" ? sevenDayUtil : fiveHourUtil
+    readonly property real _pillPct: {
+        root._tick;
+        var util = displayMode === "7d" ? sevenDayUtil : fiveHourUtil;
+        var reset = displayMode === "7d" ? sevenDayReset : fiveHourReset;
+        return Utils.effectiveUtilization(util, reset);
+    }
     readonly property color _pillColor: dataAvailable ? Utils.utilizationColor(_pillPct, Theme) : Theme.surfaceVariantText
     readonly property string _pillReset: displayMode === "7d" ? sevenDayReset : fiveHourReset
 
     // === Tick timer (forces re-eval of reset time bindings) ===
     property int _tick: 0
+    property bool _resetDetected: false
     Timer {
         interval: 30000
-        running: true
+        running: root.dataAvailable
         repeat: true
-        onTriggered: root._tick++
+        onTriggered: {
+            root._tick++;
+            if (root.dataAvailable && !root._resetDetected) {
+                var now = Date.now();
+                var resets = [root.fiveHourReset, root.sevenDayReset, root.sevenDayOpusReset, root.sevenDaySonnetReset];
+                for (var i = 0; i < resets.length; i++) {
+                    if (resets[i] && new Date(resets[i]).getTime() <= now) {
+                        root._resetDetected = true;
+                        root.loadUsage();
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // === Error helper ===
@@ -312,6 +331,7 @@ PluginComponent {
 
         dataAvailable = true;
         errorMessage = "";
+        _resetDetected = false;
     }
 
     function fetchUsage() {
@@ -354,7 +374,9 @@ PluginComponent {
     ccWidgetPrimaryText: "Claude Usage"
     ccWidgetSecondaryText: {
         if (!dataAvailable) return errorMessage || "Loading...";
-        return Math.round(fiveHourUtil) + "% (5h) \u2022 " + Math.round(sevenDayUtil) + "% (7d)";
+        root._tick;
+        return Math.round(Utils.effectiveUtilization(fiveHourUtil, fiveHourReset)) + "% (5h) \u2022 "
+             + Math.round(Utils.effectiveUtilization(sevenDayUtil, sevenDayReset)) + "% (7d)";
     }
     ccWidgetIsActive: dataAvailable
 
@@ -511,7 +533,7 @@ PluginComponent {
                     iconName: "schedule"
                     title: "5-Hour Window"
                     subtitle: { root._tick; return Utils.formatResetTimeVerbose(root.fiveHourReset); }
-                    utilization: root.fiveHourUtil
+                    utilization: { root._tick; return Utils.effectiveUtilization(root.fiveHourUtil, root.fiveHourReset); }
                 }
 
                 UsageCard {
@@ -519,7 +541,7 @@ PluginComponent {
                     iconName: "date_range"
                     title: "Weekly Window"
                     subtitle: { root._tick; return Utils.formatResetDateTime(root.sevenDayReset); }
-                    utilization: root.sevenDayUtil
+                    utilization: { root._tick; return Utils.effectiveUtilization(root.sevenDayUtil, root.sevenDayReset); }
                 }
 
                 UsageCard {
@@ -527,7 +549,7 @@ PluginComponent {
                     iconName: "auto_awesome"
                     title: "Weekly Opus"
                     subtitle: { root._tick; return Utils.formatResetDateTime(root.sevenDayOpusReset); }
-                    utilization: root.sevenDayOpusUtil
+                    utilization: { root._tick; return Utils.effectiveUtilization(root.sevenDayOpusUtil, root.sevenDayOpusReset); }
                 }
 
                 UsageCard {
@@ -535,7 +557,7 @@ PluginComponent {
                     iconName: "bolt"
                     title: "Weekly Sonnet"
                     subtitle: { root._tick; return Utils.formatResetDateTime(root.sevenDaySonnetReset); }
-                    utilization: root.sevenDaySonnetUtil
+                    utilization: { root._tick; return Utils.effectiveUtilization(root.sevenDaySonnetUtil, root.sevenDaySonnetReset); }
                 }
 
                 UsageCard {
@@ -664,13 +686,14 @@ PluginComponent {
             UsageBar {
                 width: parent.width
                 utilization: parent.parent.utilization
+                barColor: parent.parent.barColor
             }
         }
     }
 
     component UsageBar: Item {
         property real utilization: 0
-        readonly property color barColor: Utils.utilizationColor(utilization, Theme)
+        property color barColor: Utils.utilizationColor(utilization, Theme)
         height: 6
 
         StyledRect {

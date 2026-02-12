@@ -50,6 +50,13 @@ function formatResetDateTime(isoString) {
            " at " + hrsStr + ":" + minStr;
 }
 
+function effectiveUtilization(pct, isoString) {
+    if (!isoString) return pct;
+    var d = new Date(isoString);
+    if (d.getTime() <= Date.now()) return 0;
+    return pct;
+}
+
 function utilizationColor(pct, theme) {
     if (pct >= 80) return theme.error;
     if (pct >= 50) return theme.warning;
