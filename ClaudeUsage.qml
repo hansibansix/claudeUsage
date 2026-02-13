@@ -38,6 +38,30 @@ PluginComponent {
     property int _refreshRetries: 0
     readonly property int _maxRefreshRetries: 5
     property bool _savingCredentials: false
+    property bool _permanentAuthError: false
+    property bool _loginInProgress: false
+    property string _codeVerifier: ""
+    property string _codeChallenge: ""
+    property string _oauthState: ""
+    property int _callbackPort: 0
+    readonly property string _callbackScript:
+        "import http.server,urllib.parse,threading\n" +
+        "class H(http.server.BaseHTTPRequestHandler):\n" +
+        " def do_GET(self):\n" +
+        "  q=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)\n" +
+        "  c,e=q.get('code',[''])[0],q.get('error',[''])[0]\n" +
+        "  self.send_response(200);self.send_header('Content-Type','text/html');self.end_headers()\n" +
+        "  if c:\n" +
+        "   self.wfile.write(b'<h1>Login OK</h1><p>You can close this tab.</p>')\n" +
+        "   print('CODE:'+c,flush=True)\n" +
+        "  else:\n" +
+        "   self.wfile.write(b'<h1>Login Failed</h1>')\n" +
+        "   print('ERROR:'+(e or 'unknown'),flush=True)\n" +
+        "  threading.Thread(target=self.server.shutdown).start()\n" +
+        " def log_message(self,*a):pass\n" +
+        "s=http.server.HTTPServer(('127.0.0.1',0),H)\n" +
+        "print('PORT:'+str(s.server_address[1]),flush=True)\n" +
+        "s.serve_forever()"
 
     property real fiveHourUtil: 0
     property string fiveHourReset: ""
@@ -150,6 +174,8 @@ PluginComponent {
                 root._savingCredentials = false;
                 return;
             }
+            root._permanentAuthError = false;
+            root._refreshRetries = 0;
             root.loading = true;
             credentialsFile.reload();
         }
@@ -180,9 +206,15 @@ PluginComponent {
             try {
                 var resp = JSON.parse(output);
                 if (resp.error) {
-                    console.warn("[claudeUsage] Token refresh error: " + resp.error + " - " + (resp.error_description || ""));
-                    root.setError("Token refresh failed\n" + (resp.error_description || "Retrying..."));
-                    root.scheduleRetry();
+                    var permanent = (resp.error === "invalid_grant" || resp.error === "invalid_client" || resp.error === "unauthorized_client");
+                    console.warn("[claudeUsage] Token refresh error: " + resp.error + " - " + (resp.error_description || "") + (permanent ? " (permanent)" : ""));
+                    if (permanent) {
+                        root._permanentAuthError = true;
+                        root.setError("Session expired\nRun 'claude' to log in");
+                    } else {
+                        root.setError("Token refresh failed\n" + (resp.error_description || "Retrying..."));
+                        root.scheduleRetry();
+                    }
                     output = "";
                     return;
                 }
@@ -210,6 +242,7 @@ PluginComponent {
     }
 
     function refreshOAuthToken() {
+        if (_permanentAuthError) return;
         if (!refreshToken) {
             setError("No refresh token available\nRun 'claude' to log in");
             return;
@@ -253,6 +286,162 @@ PluginComponent {
             }
         });
         credSaver.running = true;
+    }
+
+    // === OAuth login flow ===
+    Process {
+        id: pkceGenerator
+        property string output: ""
+        stdout: SplitParser {
+            onRead: line => { pkceGenerator.output = line; }
+        }
+        onExited: (exitCode) => {
+            if (exitCode !== 0 || !pkceGenerator.output) {
+                console.warn("[claudeUsage] PKCE generation failed: exitCode=" + exitCode);
+                root._loginInProgress = false;
+                root.setError("Login failed\nPKCE generation error");
+                return;
+            }
+            var parts = pkceGenerator.output.split(" ");
+            if (parts.length < 3) {
+                console.warn("[claudeUsage] PKCE output malformed: " + pkceGenerator.output);
+                root._loginInProgress = false;
+                root.setError("Login failed\nPKCE generation error");
+                return;
+            }
+            root._codeVerifier = parts[0];
+            root._codeChallenge = parts[1];
+            root._oauthState = parts[2];
+            callbackServer.command = ["python3", "-u", "-c", root._callbackScript];
+            callbackServer.running = true;
+        }
+    }
+
+    Process {
+        id: callbackServer
+        stdout: SplitParser {
+            onRead: line => {
+                if (line.startsWith("PORT:")) {
+                    root._callbackPort = parseInt(line.substring(5));
+                    var authUrl = "https://claude.ai/oauth/authorize" +
+                        "?code=true" +
+                        "&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" +
+                        "&response_type=code" +
+                        "&redirect_uri=" + encodeURIComponent("http://localhost:" + root._callbackPort + "/callback") +
+                        "&scope=" + encodeURIComponent("org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers") +
+                        "&code_challenge=" + root._codeChallenge +
+                        "&code_challenge_method=S256" +
+                        "&state=" + root._oauthState;
+                    browserOpener.command = ["xdg-open", authUrl];
+                    browserOpener.running = true;
+                } else if (line.startsWith("CODE:")) {
+                    root.exchangeAuthCode(line.substring(5));
+                } else if (line.startsWith("ERROR:")) {
+                    root._loginInProgress = false;
+                    root.setError("Login failed\n" + line.substring(6));
+                }
+            }
+        }
+        onExited: (exitCode) => {
+            if (root._loginInProgress && exitCode !== 0) {
+                console.warn("[claudeUsage] Callback server exited: exitCode=" + exitCode);
+                root._loginInProgress = false;
+                root.setError("Login failed\nCallback server error");
+            }
+        }
+    }
+
+    Process { id: browserOpener }
+
+    Process {
+        id: tokenExchanger
+        property string output: ""
+        stdout: SplitParser {
+            onRead: line => { tokenExchanger.output += line; }
+        }
+        onExited: (exitCode) => {
+            root._loginInProgress = false;
+            if (exitCode !== 0 || !tokenExchanger.output) {
+                console.warn("[claudeUsage] Token exchange failed: exitCode=" + exitCode);
+                root.setError("Login failed\nToken exchange error");
+                tokenExchanger.output = "";
+                return;
+            }
+            try {
+                var resp = JSON.parse(tokenExchanger.output);
+                if (resp.error) {
+                    console.warn("[claudeUsage] Token exchange error: " + resp.error + " - " + (resp.error_description || ""));
+                    root.setError("Login failed\n" + (resp.error_description || resp.error));
+                    tokenExchanger.output = "";
+                    return;
+                }
+                if (!resp.access_token) {
+                    root.setError("Login failed\nNo access token in response");
+                    tokenExchanger.output = "";
+                    return;
+                }
+                root._permanentAuthError = false;
+                root._refreshRetries = 0;
+                root.accessToken = resp.access_token;
+                root.refreshToken = resp.refresh_token || "";
+                root.expiresAt = Date.now() + ((resp.expires_in || 3600) * 1000);
+                root.saveCredentials();
+                root.fetchUsage();
+            } catch (e) {
+                console.warn("[claudeUsage] Token exchange parse error: " + e);
+                root.setError("Login failed\nInvalid response");
+            }
+            tokenExchanger.output = "";
+        }
+    }
+
+    Timer {
+        id: loginTimeout
+        interval: 120000
+        running: root._loginInProgress
+        repeat: false
+        onTriggered: {
+            console.warn("[claudeUsage] Login timed out");
+            root._loginInProgress = false;
+            if (callbackServer.running) callbackServer.running = false;
+            root.setError("Login timed out\nTry again");
+        }
+    }
+
+    function startLogin() {
+        if (_loginInProgress) return;
+        _loginInProgress = true;
+        _permanentAuthError = false;
+        errorMessage = "";
+        loading = false;
+        pkceGenerator.output = "";
+        pkceGenerator.command = ["bash", "-c",
+            "V=$(openssl rand -base64 32 | tr -d '\\n' | tr '+/' '-_' | tr -d '='); " +
+            "C=$(printf '%s' \"$V\" | openssl dgst -sha256 -binary | openssl base64 | tr -d '\\n' | tr '+/' '-_' | tr -d '='); " +
+            "S=$(openssl rand -base64 32 | tr -d '\\n' | tr '+/' '-_' | tr -d '='); " +
+            "echo \"$V $C $S\""
+        ];
+        pkceGenerator.running = true;
+    }
+
+    function exchangeAuthCode(code) {
+        if (tokenExchanger.running) return;
+        tokenExchanger.output = "";
+        tokenExchanger.command = [
+            "curl", "-sS", "--connect-timeout", "10", "--max-time", "15",
+            "-X", "POST",
+            "-H", "Content-Type: application/json",
+            "-d", JSON.stringify({
+                grant_type: "authorization_code",
+                code: code,
+                redirect_uri: "http://localhost:" + _callbackPort + "/callback",
+                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                code_verifier: _codeVerifier,
+                state: _oauthState
+            }),
+            "https://claude.ai/v1/oauth/token"
+        ];
+        tokenExchanger.running = true;
     }
 
     // === Usage API ===
@@ -364,7 +553,7 @@ PluginComponent {
         interval: root.refreshIntervalMinutes * 60 * 1000
         running: true
         repeat: true
-        onTriggered: { root._refreshRetries = 0; root.loadUsage(); }
+        onTriggered: { if (!root._permanentAuthError) { root._refreshRetries = 0; root.loadUsage(); } }
     }
 
     Component.onCompleted: root.loadUsage()
@@ -486,7 +675,9 @@ PluginComponent {
                     width: parent.width
                     height: errorCol.implicitHeight + Theme.spacingL * 2
                     radius: Theme.cornerRadius
-                    color: Qt.rgba(Theme.error.r, Theme.error.g, Theme.error.b, 0.1)
+                    color: root._loginInProgress
+                        ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.1)
+                        : Qt.rgba(Theme.error.r, Theme.error.g, Theme.error.b, 0.1)
 
                     Column {
                         id: errorCol
@@ -496,9 +687,9 @@ PluginComponent {
 
                         DankIcon {
                             anchors.horizontalCenter: parent.horizontalCenter
-                            name: "cloud_off"
+                            name: root._loginInProgress ? "hourglass_empty" : "cloud_off"
                             size: 40
-                            color: Theme.error
+                            color: root._loginInProgress ? Theme.primary : Theme.error
                             opacity: 0.6
                         }
 
@@ -508,20 +699,60 @@ PluginComponent {
 
                             StyledText {
                                 width: parent.width
-                                text: "Unable to load usage"
+                                text: root._loginInProgress ? "Waiting for login..." : "Unable to load usage"
                                 font.pixelSize: Theme.fontSizeMedium
                                 font.weight: Font.Medium
-                                color: Theme.error
+                                color: root._loginInProgress ? Theme.primary : Theme.error
                                 horizontalAlignment: Text.AlignHCenter
                             }
 
                             StyledText {
                                 width: parent.width
-                                text: root.errorMessage || "Check your credentials"
+                                text: root._loginInProgress ? "Complete login in your browser" : (root.errorMessage || "Check your credentials")
                                 font.pixelSize: Theme.fontSizeSmall
                                 color: Theme.surfaceVariantText
                                 wrapMode: Text.WordWrap
                                 horizontalAlignment: Text.AlignHCenter
+                            }
+                        }
+
+                        MouseArea {
+                            visible: !root._loginInProgress && !root.loading
+                            width: loginBtn.width
+                            height: loginBtn.height
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            cursorShape: Qt.PointingHandCursor
+                            hoverEnabled: true
+                            onClicked: root.startLogin()
+
+                            StyledRect {
+                                id: loginBtn
+                                width: loginBtnRow.width + Theme.spacingL * 2
+                                height: loginBtnRow.height + Theme.spacingS * 2
+                                radius: Theme.cornerRadius
+                                color: Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b,
+                                    parent.containsMouse ? 0.25 : 0.15)
+
+                                Row {
+                                    id: loginBtnRow
+                                    anchors.centerIn: parent
+                                    spacing: Theme.spacingS
+
+                                    DankIcon {
+                                        name: "login"
+                                        size: 16
+                                        color: Theme.primary
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+
+                                    StyledText {
+                                        text: "Log in"
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        font.weight: Font.Medium
+                                        color: Theme.primary
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                }
                             }
                         }
                     }
