@@ -477,11 +477,31 @@ PluginComponent {
 
             try {
                 var resp = JSON.parse(body);
+                if (resp.error) {
+                    console.warn("[claudeUsage] Usage fetch API error: " + JSON.stringify(resp.error));
+                    if (!root.dataAvailable) {
+                        root.setError(resp.error.type === "rate_limit_error" ? "Rate limited by API\nRetrying..." : "API Error\nRetrying...");
+                    }
+                    root.scheduleRetry();
+                    return;
+                }
+                
+                if (httpCode !== 200) {
+                    console.warn("[claudeUsage] Usage fetch HTTP " + httpCode + ": " + body.substring(0, 100));
+                    if (!root.dataAvailable) {
+                        root.setError("HTTP " + httpCode + "\nRetrying...");
+                    }
+                    root.scheduleRetry();
+                    return;
+                }
+
                 root._refreshRetries = 0;
                 root.applyUsageData(resp);
             } catch (e) {
                 console.warn("[claudeUsage] Usage parse error: " + e + " raw=" + body.substring(0, 200));
-                root.setError("Failed to parse usage data\nRetrying...");
+                if (!root.dataAvailable) {
+                    root.setError("Failed to parse usage data\nRetrying...");
+                }
                 root.scheduleRetry();
             }
         }
