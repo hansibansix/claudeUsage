@@ -10,10 +10,39 @@ PluginComponent {
     id: root
     layerNamespacePlugin: "claude-usage"
     popoutWidth: 360
-    popoutHeight: 520
+    popoutHeight: _dynamicPopoutHeight
+
+    // === Constants ===
+    readonly property string _oauthClientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    readonly property string _userAgent: "claude-code/2.0.32"
+    readonly property string _tokenEndpoint: "https://platform.claude.com/v1/oauth/token"
+    readonly property string _authorizeEndpoint: "https://platform.claude.com/oauth/authorize"
+    readonly property int _tokenRefreshBufferMs: 300000  // refresh 5 min before expiry (matches CLI)
+
+    // === Dynamic popout height ===
+    readonly property int _dynamicPopoutHeight: {
+        if (!dataAvailable) return 280;
+        var h = 80; // header + padding
+        var cardH = 90; // approximate card height
+        var planH = 70; // plan info card height
+        if (showFiveHour) h += cardH;
+        if (showSevenDay) h += cardH;
+        if (showOpus && sevenDayOpusUtil > 0) h += cardH;
+        if (showSonnet && sevenDaySonnetUtil > 0) h += cardH;
+        if (showExtraUsage && extraUsageEnabled) h += cardH;
+        if (showPlanInfo) h += planH;
+        // Add spacing between cards
+        h += Theme.spacingM * 2;
+        return Math.max(280, Math.min(h, 700));
+    }
 
     // === Settings ===
-    property int refreshIntervalMinutes: parseInt(pluginData.refreshInterval) || 2
+    property int refreshIntervalMinutes: {
+        var val = parseInt(pluginData.refreshInterval);
+        if (isNaN(val) || val < 1) return 2;
+        if (val > 60) return 60;
+        return val;
+    }
     property string displayMode: pluginData.displayMode || "5h"
     property bool showFiveHour: pluginData.showFiveHour !== false
     property bool showSevenDay: pluginData.showSevenDay !== false
@@ -39,6 +68,7 @@ PluginComponent {
     readonly property int _maxRefreshRetries: 5
     property bool _savingCredentials: false
     property bool _permanentAuthError: false
+    property bool _refreshingToken: false
     property bool _loginInProgress: false
     property string _codeVerifier: ""
     property string _codeChallenge: ""
@@ -117,7 +147,7 @@ PluginComponent {
         loading = false;
     }
 
-    // === Refresh retry timer ===
+    // === Refresh retry timer with exponential backoff ===
     Timer {
         id: refreshRetryTimer
         interval: 30000
@@ -129,8 +159,13 @@ PluginComponent {
     function scheduleRetry() {
         if (_refreshRetries < _maxRefreshRetries) {
             _refreshRetries++;
-            console.warn("[claudeUsage] Scheduling retry " + _refreshRetries + "/" + _maxRefreshRetries + " in 30s");
+            var delay = 30000 * Math.pow(2, _refreshRetries - 1); // 30s, 60s, 120s, 240s, 480s
+            delay = Math.min(delay, 300000); // cap at 5 minutes
+            console.warn("[claudeUsage] Scheduling retry " + _refreshRetries + "/" + _maxRefreshRetries + " in " + Math.round(delay / 1000) + "s");
+            refreshRetryTimer.interval = delay;
             refreshRetryTimer.restart();
+        } else {
+            console.warn("[claudeUsage] Max retries reached (" + _maxRefreshRetries + "), giving up");
         }
     }
 
@@ -160,10 +195,12 @@ PluginComponent {
                 root.subscriptionType = oauth.subscriptionType || "";
                 root.rateLimitTier = oauth.rateLimitTier || "";
 
-                if (root.expiresAt > 0 && Date.now() > root.expiresAt)
+                if (root.expiresAt > 0 && Date.now() > (root.expiresAt - root._tokenRefreshBufferMs))
                     root.refreshOAuthToken();
-                else
+                else if (!root._refreshingToken) {
+                    root.scheduleProactiveRefresh();
                     root.fetchUsage();
+                }
             } catch (e) {
                 root.setError("Failed to parse credentials");
             }
@@ -185,7 +222,7 @@ PluginComponent {
         }
     }
 
-    // === Token refresh ===
+    // === Token refresh (payload inside bash -c script, not visible in /proc/cmdline) ===
     Process {
         id: tokenRefresher
         property string output: ""
@@ -194,10 +231,17 @@ PluginComponent {
             onRead: line => { tokenRefresher.output += line; }
         }
 
+        stderr: SplitParser {
+            onRead: line => { console.warn("[claudeUsage] tokenRefresher stderr: " + line); }
+        }
+
         onExited: (exitCode) => {
+            root._refreshingToken = false;
+
             if (exitCode !== 0 || !output) {
                 console.warn("[claudeUsage] Token refresh failed: exitCode=" + exitCode + " output=" + (output || "(empty)"));
                 root.setError("Token refresh failed\nRetrying...");
+                root._resetDetected = false;
                 root.scheduleRetry();
                 output = "";
                 return;
@@ -206,13 +250,25 @@ PluginComponent {
             try {
                 var resp = JSON.parse(output);
                 if (resp.error) {
-                    var permanent = (resp.error === "invalid_grant" || resp.error === "invalid_client" || resp.error === "unauthorized_client");
-                    console.warn("[claudeUsage] Token refresh error: " + resp.error + " - " + (resp.error_description || "") + (permanent ? " (permanent)" : ""));
+                    // OAuth errors: {"error": "invalid_grant", "error_description": "..."}
+                    // API errors:   {"error": {"type": "rate_limit_error", "message": "..."}}
+                    var errCode = (typeof resp.error === "string") ? resp.error : (resp.error.type || "unknown");
+                    var errMsg = resp.error_description || (typeof resp.error === "object" ? resp.error.message : "") || "";
+                    var permanent = (errCode === "invalid_grant" || errCode === "invalid_client" || errCode === "unauthorized_client");
+                    var rateLimited = (errCode === "rate_limit_error");
+                    console.warn("[claudeUsage] Token refresh error: " + errCode + " - " + errMsg + (permanent ? " (permanent)" : "") + (rateLimited ? " (rate limited)" : ""));
                     if (permanent) {
                         root._permanentAuthError = true;
                         root.setError("Session expired\nRun 'claude' to log in");
+                    } else if (rateLimited) {
+                        root.setError("Rate limited\nBacking off...");
+                        root._resetDetected = false;
+                        // Force higher backoff floor for rate limits
+                        if (root._refreshRetries < 2) root._refreshRetries = 2;
+                        root.scheduleRetry();
                     } else {
-                        root.setError("Token refresh failed\n" + (resp.error_description || "Retrying..."));
+                        root.setError("Token refresh failed\n" + (errMsg || "Retrying..."));
+                        root._resetDetected = false;
                         root.scheduleRetry();
                     }
                     output = "";
@@ -221,6 +277,7 @@ PluginComponent {
                 if (!resp.access_token) {
                     console.warn("[claudeUsage] Token refresh: no access_token in response");
                     root.setError("Token refresh failed\nRetrying...");
+                    root._resetDetected = false;
                     root.scheduleRetry();
                     output = "";
                     return;
@@ -231,10 +288,12 @@ PluginComponent {
                 root.refreshToken = resp.refresh_token || root.refreshToken;
                 root.expiresAt = Date.now() + (resp.expires_in * 1000);
                 root.saveCredentials();
+                root.scheduleProactiveRefresh();
                 root.fetchUsage();
             } catch (e) {
                 console.warn("[claudeUsage] Token refresh parse error: " + e + " raw=" + output.substring(0, 200));
                 root.setError("Token refresh failed\nRetrying...");
+                root._resetDetected = false;
                 root.scheduleRetry();
             }
             output = "";
@@ -247,30 +306,67 @@ PluginComponent {
             setError("No refresh token available\nRun 'claude' to log in");
             return;
         }
-        if (tokenRefresher.running) return;
+        if (tokenRefresher.running || _refreshingToken) return;
 
+        _refreshingToken = true;
         tokenRefresher.output = "";
+        var payload = JSON.stringify({
+            grant_type: "refresh_token",
+            client_id: _oauthClientId,
+            refresh_token: refreshToken
+        });
         tokenRefresher.command = [
-            "curl", "-sS", "--connect-timeout", "10", "--max-time", "15",
-            "-X", "POST",
-            "-H", "Content-Type: application/json",
-            "-d", JSON.stringify({
-                grant_type: "refresh_token",
-                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                refresh_token: refreshToken
-            }),
-            "https://console.anthropic.com/v1/oauth/token"
+            "bash", "-c",
+            "exec curl -sS --connect-timeout 10 --max-time 15 " +
+            "-X POST " +
+            "-H 'Content-Type: application/json' " +
+            "-d '" + payload.replace(/'/g, "'\\''") + "' " +
+            "'" + _tokenEndpoint + "'"
         ];
         tokenRefresher.running = true;
     }
 
-    // === Save refreshed credentials ===
+    // === Proactive token refresh (refresh before expiry, like CLI does) ===
+    Timer {
+        id: proactiveRefreshTimer
+        running: false
+        repeat: false
+        onTriggered: {
+            if (root._permanentAuthError || root._refreshingToken) return;
+            console.log("[claudeUsage] Proactive token refresh (before expiry)");
+            root.refreshOAuthToken();
+        }
+    }
+
+    function scheduleProactiveRefresh() {
+        if (expiresAt <= 0) return;
+        var msUntilRefresh = expiresAt - _tokenRefreshBufferMs - Date.now();
+        if (msUntilRefresh <= 0) return; // already due, will be handled by normal flow
+        proactiveRefreshTimer.interval = msUntilRefresh;
+        proactiveRefreshTimer.restart();
+        console.log("[claudeUsage] Scheduled proactive refresh in " + Math.round(msUntilRefresh / 60000) + " min");
+    }
+
+    // === Save refreshed credentials (atomic write with secure permissions) ===
     Process {
         id: credSaver
         property string jsonData: ""
-        command: ["tee", root.credentialsPath]
+        command: ["bash", "-c",
+            "umask 077 && T=$(mktemp '" + root.credentialsPath + ".XXXXXX') && " +
+            "cat > \"$T\" && mv \"$T\" '" + root.credentialsPath + "'"
+        ]
         stdinEnabled: true
         onStarted: { write(jsonData + "\n"); stdinClose(); }
+
+        stderr: SplitParser {
+            onRead: line => { console.warn("[claudeUsage] credSaver stderr: " + line); }
+        }
+
+        onExited: (exitCode) => {
+            if (exitCode !== 0) {
+                console.warn("[claudeUsage] Failed to save credentials: exitCode=" + exitCode);
+            }
+        }
     }
 
     function saveCredentials() {
@@ -294,6 +390,9 @@ PluginComponent {
         property string output: ""
         stdout: SplitParser {
             onRead: line => { pkceGenerator.output = line; }
+        }
+        stderr: SplitParser {
+            onRead: line => { console.warn("[claudeUsage] pkceGenerator stderr: " + line); }
         }
         onExited: (exitCode) => {
             if (exitCode !== 0 || !pkceGenerator.output) {
@@ -323,9 +422,9 @@ PluginComponent {
             onRead: line => {
                 if (line.startsWith("PORT:")) {
                     root._callbackPort = parseInt(line.substring(5));
-                    var authUrl = "https://claude.ai/oauth/authorize" +
+                    var authUrl = root._authorizeEndpoint +
                         "?code=true" +
-                        "&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e" +
+                        "&client_id=" + root._oauthClientId +
                         "&response_type=code" +
                         "&redirect_uri=" + encodeURIComponent("http://localhost:" + root._callbackPort + "/callback") +
                         "&scope=" + encodeURIComponent("org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers") +
@@ -341,6 +440,9 @@ PluginComponent {
                     root.setError("Login failed\n" + line.substring(6));
                 }
             }
+        }
+        stderr: SplitParser {
+            onRead: line => { console.warn("[claudeUsage] callbackServer stderr: " + line); }
         }
         onExited: (exitCode) => {
             if (root._loginInProgress && exitCode !== 0) {
@@ -358,6 +460,9 @@ PluginComponent {
         property string output: ""
         stdout: SplitParser {
             onRead: line => { tokenExchanger.output += line; }
+        }
+        stderr: SplitParser {
+            onRead: line => { console.warn("[claudeUsage] tokenExchanger stderr: " + line); }
         }
         onExited: (exitCode) => {
             root._loginInProgress = false;
@@ -386,6 +491,7 @@ PluginComponent {
                 root.refreshToken = resp.refresh_token || "";
                 root.expiresAt = Date.now() + ((resp.expires_in || 3600) * 1000);
                 root.saveCredentials();
+                root.scheduleProactiveRefresh();
                 root.fetchUsage();
             } catch (e) {
                 console.warn("[claudeUsage] Token exchange parse error: " + e);
@@ -427,30 +533,36 @@ PluginComponent {
     function exchangeAuthCode(code) {
         if (tokenExchanger.running) return;
         tokenExchanger.output = "";
+        var payload = JSON.stringify({
+            grant_type: "authorization_code",
+            code: code,
+            redirect_uri: "http://localhost:" + _callbackPort + "/callback",
+            client_id: _oauthClientId,
+            code_verifier: _codeVerifier,
+            state: _oauthState
+        });
         tokenExchanger.command = [
-            "curl", "-sS", "--connect-timeout", "10", "--max-time", "15",
-            "-X", "POST",
-            "-H", "Content-Type: application/json",
-            "-d", JSON.stringify({
-                grant_type: "authorization_code",
-                code: code,
-                redirect_uri: "http://localhost:" + _callbackPort + "/callback",
-                client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                code_verifier: _codeVerifier,
-                state: _oauthState
-            }),
-            "https://claude.ai/v1/oauth/token"
+            "bash", "-c",
+            "exec curl -sS --connect-timeout 10 --max-time 15 " +
+            "-X POST " +
+            "-H 'Content-Type: application/json' " +
+            "-d '" + payload.replace(/'/g, "'\\''") + "' " +
+            "'" + root._tokenEndpoint + "'"
         ];
         tokenExchanger.running = true;
     }
 
-    // === Usage API ===
+    // === Usage API (token passed inside bash -c script, not visible in /proc/cmdline) ===
     Process {
         id: usageFetcher
         property string output: ""
 
         stdout: SplitParser {
             onRead: line => { usageFetcher.output += line; }
+        }
+
+        stderr: SplitParser {
+            onRead: line => { console.warn("[claudeUsage] usageFetcher stderr: " + line); }
         }
 
         onExited: (exitCode) => {
@@ -465,6 +577,7 @@ PluginComponent {
             if (exitCode !== 0 || !body) {
                 console.warn("[claudeUsage] Usage fetch failed: exitCode=" + exitCode);
                 root.setError("Failed to fetch usage data\nRetrying...");
+                root._resetDetected = false;
                 root.scheduleRetry();
                 return;
             }
@@ -475,22 +588,38 @@ PluginComponent {
                 return;
             }
 
+            if (httpCode === 429) {
+                console.warn("[claudeUsage] Usage fetch got 429 (rate limited)");
+                if (!root.dataAvailable) {
+                    root.setError("Rate limited by API\nBacking off...");
+                }
+                root._resetDetected = false;
+                if (root._refreshRetries < 2) root._refreshRetries = 2;
+                root.scheduleRetry();
+                return;
+            }
+
             try {
                 var resp = JSON.parse(body);
                 if (resp.error) {
+                    var isRateLimit = (typeof resp.error === "object" && resp.error.type === "rate_limit_error") ||
+                                     (typeof resp.error === "string" && resp.error === "rate_limit_error");
                     console.warn("[claudeUsage] Usage fetch API error: " + JSON.stringify(resp.error));
                     if (!root.dataAvailable) {
-                        root.setError(resp.error.type === "rate_limit_error" ? "Rate limited by API\nRetrying..." : "API Error\nRetrying...");
+                        root.setError(isRateLimit ? "Rate limited by API\nBacking off..." : "API Error\nRetrying...");
                     }
+                    root._resetDetected = false;
+                    if (isRateLimit && root._refreshRetries < 2) root._refreshRetries = 2;
                     root.scheduleRetry();
                     return;
                 }
-                
+
                 if (httpCode !== 200) {
                     console.warn("[claudeUsage] Usage fetch HTTP " + httpCode + ": " + body.substring(0, 100));
                     if (!root.dataAvailable) {
                         root.setError("HTTP " + httpCode + "\nRetrying...");
                     }
+                    root._resetDetected = false;
                     root.scheduleRetry();
                     return;
                 }
@@ -502,6 +631,7 @@ PluginComponent {
                 if (!root.dataAvailable) {
                     root.setError("Failed to parse usage data\nRetrying...");
                 }
+                root._resetDetected = false;
                 root.scheduleRetry();
             }
         }
@@ -549,16 +679,19 @@ PluginComponent {
             return;
         }
         if (usageFetcher.running) return;
+        if (_refreshingToken) return; // wait for token refresh to complete
 
         usageFetcher.output = "";
         usageFetcher.command = [
-            "curl", "-sS", "--connect-timeout", "10", "--max-time", "15",
-            "-w", "\nHTTP_STATUS:%{http_code}",
-            "-H", "Accept: application/json",
-            "-H", "Authorization: Bearer " + accessToken,
-            "-H", "anthropic-beta: oauth-2025-04-20",
-            "-H", "User-Agent: claude-code/2.0.32",
-            "https://api.anthropic.com/api/oauth/usage"
+            "bash", "-c",
+            "T='" + accessToken.replace(/'/g, "'\\''") + "'; " +
+            "exec curl -sS --connect-timeout 10 --max-time 15 " +
+            "-w '\\nHTTP_STATUS:%{http_code}' " +
+            "-H 'Accept: application/json' " +
+            "-H \"Authorization: Bearer ${T}\" " +
+            "-H 'anthropic-beta: oauth-2025-04-20' " +
+            "-H 'User-Agent: " + _userAgent + "' " +
+            "'https://api.anthropic.com/api/oauth/usage'"
         ];
         usageFetcher.running = true;
     }
@@ -573,10 +706,25 @@ PluginComponent {
         interval: root.refreshIntervalMinutes * 60 * 1000
         running: true
         repeat: true
-        onTriggered: { if (!root._permanentAuthError) { root._refreshRetries = 0; root.loadUsage(); } }
+        onTriggered: {
+            // Don't interfere if we're in an error retry cycle or refreshing token
+            if (root._permanentAuthError) return;
+            if (refreshRetryTimer.running || root._refreshingToken) return;
+            root._refreshRetries = 0;
+            root.loadUsage();
+        }
     }
 
     Component.onCompleted: root.loadUsage()
+
+    // === Cleanup on destruction ===
+    Component.onDestruction: {
+        if (callbackServer.running) callbackServer.running = false;
+        if (tokenRefresher.running) tokenRefresher.running = false;
+        if (usageFetcher.running) usageFetcher.running = false;
+        if (tokenExchanger.running) tokenExchanger.running = false;
+        proactiveRefreshTimer.running = false;
+    }
 
     // === Widget properties ===
     ccWidgetIcon: "smart_toy"
