@@ -68,6 +68,7 @@ PluginComponent {
     readonly property int _maxRefreshRetries: 5
     property bool _savingCredentials: false
     property bool _permanentAuthError: false
+    readonly property bool _hasCredentials: accessToken !== "" && !_permanentAuthError
     property bool _refreshingToken: false
     property bool _loginInProgress: false
     property string _codeVerifier: ""
@@ -156,17 +157,24 @@ PluginComponent {
         onTriggered: root.loadUsage()
     }
 
-    function scheduleRetry() {
-        if (_refreshRetries < _maxRefreshRetries) {
-            _refreshRetries++;
-            var delay = 30000 * Math.pow(2, _refreshRetries - 1); // 30s, 60s, 120s, 240s, 480s
+    function scheduleRetry(retryAfterSec) {
+        _refreshRetries++;
+        var delay;
+        if (retryAfterSec > 0) {
+            // Server-specified delay (Retry-After header)
+            delay = Math.max(retryAfterSec * 1000, 5000);   // floor 5s
+            delay = Math.min(delay, 600000);                  // cap 10min
+        } else if (_refreshRetries <= _maxRefreshRetries) {
+            delay = 30000 * Math.pow(2, _refreshRetries - 1); // 30s, 60s, 120s, 240s, 480s
             delay = Math.min(delay, 300000); // cap at 5 minutes
-            console.warn("[claudeUsage] Scheduling retry " + _refreshRetries + "/" + _maxRefreshRetries + " in " + Math.round(delay / 1000) + "s");
-            refreshRetryTimer.interval = delay;
-            refreshRetryTimer.restart();
         } else {
-            console.warn("[claudeUsage] Max retries reached (" + _maxRefreshRetries + "), giving up");
+            // Max retries exceeded — keep trying at normal refresh interval
+            _refreshRetries = 0;
+            delay = refreshIntervalMinutes * 60 * 1000;
         }
+        console.warn("[claudeUsage] Scheduling retry " + _refreshRetries + "/" + _maxRefreshRetries + " in " + Math.round(delay / 1000) + "s" + (retryAfterSec > 0 ? " (server-requested)" : ""));
+        refreshRetryTimer.interval = delay;
+        refreshRetryTimer.restart();
     }
 
     // === Credential loading (watches file for external changes) ===
@@ -261,10 +269,8 @@ PluginComponent {
                         root._permanentAuthError = true;
                         root.setError("Session expired\nRun 'claude' to log in");
                     } else if (rateLimited) {
-                        root.setError("Rate limited\nBacking off...");
+                        root.setError("Rate limited\nRetrying...");
                         root._resetDetected = false;
-                        // Force higher backoff floor for rate limits
-                        if (root._refreshRetries < 2) root._refreshRetries = 2;
                         root.scheduleRetry();
                     } else {
                         root.setError("Token refresh failed\n" + (errMsg || "Retrying..."));
@@ -552,7 +558,7 @@ PluginComponent {
         tokenExchanger.running = true;
     }
 
-    // === Usage API (token passed inside bash -c script, not visible in /proc/cmdline) ===
+    // === Usage via /v1/messages response headers (minimal haiku call) ===
     Process {
         id: usageFetcher
         property string output: ""
@@ -568,18 +574,34 @@ PluginComponent {
         onExited: (exitCode) => {
             root.loading = false;
 
-            // Extract HTTP status code appended by curl -w
-            var idx = output.lastIndexOf("HTTP_STATUS:");
-            var httpCode = idx >= 0 ? parseInt(output.substring(idx + 12)) : 0;
-            var body = idx >= 0 ? output.substring(0, idx) : output;
+            // Output format: "httpCode|5hUtil|5hReset|7dUtil|7dReset|ovUtil|ovReset|retryAfter"
+            var parts = (output || "").split("|");
             output = "";
 
-            if (exitCode !== 0 || !body) {
-                console.warn("[claudeUsage] Usage fetch failed: exitCode=" + exitCode);
-                root.setError("Failed to fetch usage data\nRetrying...");
+            if (exitCode !== 0 || parts.length < 2) {
+                console.warn("[claudeUsage] Usage fetch failed: exitCode=" + exitCode + " parts=" + parts.length);
+                if (!root.dataAvailable) {
+                    root.setError("Failed to fetch usage data\nRetrying...");
+                }
                 root._resetDetected = false;
                 root.scheduleRetry();
                 return;
+            }
+
+            var httpCode = parseInt(parts[0]) || 0;
+            var fhUtil = parseFloat(parts[1]) || 0;
+            var fhReset = parseInt(parts[2]) || 0;
+            var sdUtil = parseFloat(parts[3]) || 0;
+            var sdReset = parseInt(parts[4]) || 0;
+            var ovUtil = parseFloat(parts[5]) || 0;
+            var ovReset = parseInt(parts[6]) || 0;
+            var retryAfter = parseInt(parts[7]) || 0;
+
+            // Apply rate limit data from response headers if available (works even on 429)
+            var hasData = fhReset > 0 || sdReset > 0;
+            if (hasData) {
+                root._refreshRetries = 0;
+                root.applyHeaderData(fhUtil, fhReset, sdUtil, sdReset, ovUtil, ovReset);
             }
 
             if (httpCode === 401) {
@@ -588,48 +610,31 @@ PluginComponent {
                 return;
             }
 
-            if (httpCode === 429) {
-                console.warn("[claudeUsage] Usage fetch got 429 (rate limited)");
+            if (httpCode === 429 || httpCode >= 500) {
+                if (hasData) return; // Data already applied from headers
+                console.warn("[claudeUsage] Usage fetch HTTP " + httpCode + (retryAfter > 0 ? ", retry-after: " + retryAfter + "s" : ""));
                 if (!root.dataAvailable) {
-                    root.setError("Rate limited by API\nBacking off...");
+                    root.setError("API temporarily unavailable\nRetrying...");
                 }
                 root._resetDetected = false;
-                if (root._refreshRetries < 2) root._refreshRetries = 2;
+                root.scheduleRetry(retryAfter);
+                return;
+            }
+
+            if (httpCode !== 200 && !hasData) {
+                console.warn("[claudeUsage] Usage fetch HTTP " + httpCode);
+                if (!root.dataAvailable) {
+                    root.setError("HTTP " + httpCode + "\nRetrying...");
+                }
+                root._resetDetected = false;
                 root.scheduleRetry();
                 return;
             }
 
-            try {
-                var resp = JSON.parse(body);
-                if (resp.error) {
-                    var isRateLimit = (typeof resp.error === "object" && resp.error.type === "rate_limit_error") ||
-                                     (typeof resp.error === "string" && resp.error === "rate_limit_error");
-                    console.warn("[claudeUsage] Usage fetch API error: " + JSON.stringify(resp.error));
-                    if (!root.dataAvailable) {
-                        root.setError(isRateLimit ? "Rate limited by API\nBacking off..." : "API Error\nRetrying...");
-                    }
-                    root._resetDetected = false;
-                    if (isRateLimit && root._refreshRetries < 2) root._refreshRetries = 2;
-                    root.scheduleRetry();
-                    return;
-                }
-
-                if (httpCode !== 200) {
-                    console.warn("[claudeUsage] Usage fetch HTTP " + httpCode + ": " + body.substring(0, 100));
-                    if (!root.dataAvailable) {
-                        root.setError("HTTP " + httpCode + "\nRetrying...");
-                    }
-                    root._resetDetected = false;
-                    root.scheduleRetry();
-                    return;
-                }
-
-                root._refreshRetries = 0;
-                root.applyUsageData(resp);
-            } catch (e) {
-                console.warn("[claudeUsage] Usage parse error: " + e + " raw=" + body.substring(0, 200));
+            if (!hasData) {
+                console.warn("[claudeUsage] No rate limit headers in response");
                 if (!root.dataAvailable) {
-                    root.setError("Failed to parse usage data\nRetrying...");
+                    root.setError("No usage data available\nRetrying...");
                 }
                 root._resetDetected = false;
                 root.scheduleRetry();
@@ -637,33 +642,22 @@ PluginComponent {
         }
     }
 
-    function applyUsageData(resp) {
-        function extract(obj) {
-            return obj ? { util: obj.utilization || 0, reset: obj.resets_at || "" }
-                       : { util: 0, reset: "" };
-        }
+    function applyHeaderData(fhUtil, fhReset, sdUtil, sdReset, ovUtil, ovReset) {
+        fiveHourUtil = fhUtil * 100;
+        fiveHourReset = fhReset > 0 ? new Date(fhReset * 1000).toISOString() : "";
 
-        var fh = extract(resp.five_hour);
-        fiveHourUtil = fh.util;
-        fiveHourReset = fh.reset;
+        sevenDayUtil = sdUtil * 100;
+        sevenDayReset = sdReset > 0 ? new Date(sdReset * 1000).toISOString() : "";
 
-        var sd = extract(resp.seven_day);
-        sevenDayUtil = sd.util;
-        sevenDayReset = sd.reset;
+        // No per-model breakdown in response headers
+        sevenDayOpusUtil = 0;
+        sevenDayOpusReset = "";
+        sevenDaySonnetUtil = 0;
+        sevenDaySonnetReset = "";
 
-        var opus = extract(resp.seven_day_opus);
-        sevenDayOpusUtil = opus.util;
-        sevenDayOpusReset = opus.reset;
-
-        var sonnet = extract(resp.seven_day_sonnet);
-        sevenDaySonnetUtil = sonnet.util;
-        sevenDaySonnetReset = sonnet.reset;
-
-        if (resp.extra_usage) {
-            extraUsageEnabled = resp.extra_usage.is_enabled || false;
-            extraUsageLimit = resp.extra_usage.monthly_limit || 0;
-            extraUsageUsed = resp.extra_usage.used_credits || 0;
-            extraUsageUtil = resp.extra_usage.utilization || 0;
+        if (ovUtil > 0 || ovReset > 0) {
+            extraUsageEnabled = true;
+            extraUsageUtil = ovUtil * 100;
         } else {
             extraUsageEnabled = false;
         }
@@ -685,13 +679,21 @@ PluginComponent {
         usageFetcher.command = [
             "bash", "-c",
             "T='" + accessToken.replace(/'/g, "'\\''") + "'; " +
-            "exec curl -sS --connect-timeout 10 --max-time 15 " +
-            "-w '\\nHTTP_STATUS:%{http_code}' " +
-            "-H 'Accept: application/json' " +
+            "F=$(mktemp); " +
+            "C=$(exec curl -sS --connect-timeout 10 --max-time 15 " +
+            "-D \"$F\" -o /dev/null " +
+            "-X POST " +
+            "-H 'Content-Type: application/json' " +
             "-H \"Authorization: Bearer ${T}\" " +
+            "-H 'anthropic-version: 2023-06-01' " +
             "-H 'anthropic-beta: oauth-2025-04-20' " +
             "-H 'User-Agent: " + _userAgent + "' " +
-            "'https://api.anthropic.com/api/oauth/usage'"
+            "-d '{\"model\":\"claude-haiku-4-5-20251001\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}' " +
+            "-w '%{http_code}' " +
+            "'https://api.anthropic.com/v1/messages' 2>/dev/null); " +
+            "g() { grep -i \"^$1:\" \"$F\" 2>/dev/null | head -1 | sed 's/^[^:]*: *//' | tr -d '\\r\\n'; }; " +
+            "echo \"$C|$(g anthropic-ratelimit-unified-5h-utilization)|$(g anthropic-ratelimit-unified-5h-reset)|$(g anthropic-ratelimit-unified-7d-utilization)|$(g anthropic-ratelimit-unified-7d-reset)|$(g anthropic-ratelimit-unified-overage-utilization)|$(g anthropic-ratelimit-unified-overage-reset)|$(g retry-after)\"; " +
+            "rm -f \"$F\""
         ];
         usageFetcher.running = true;
     }
@@ -843,7 +845,7 @@ PluginComponent {
                     width: parent.width
                     height: errorCol.implicitHeight + Theme.spacingL * 2
                     radius: Theme.cornerRadius
-                    color: root._loginInProgress
+                    color: root._loginInProgress || root._hasCredentials
                         ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.1)
                         : Qt.rgba(Theme.error.r, Theme.error.g, Theme.error.b, 0.1)
 
@@ -855,10 +857,19 @@ PluginComponent {
 
                         DankIcon {
                             anchors.horizontalCenter: parent.horizontalCenter
-                            name: root._loginInProgress ? "hourglass_empty" : "cloud_off"
+                            name: root._loginInProgress ? "hourglass_empty"
+                                : root._hasCredentials ? "sync" : "cloud_off"
                             size: 40
-                            color: root._loginInProgress ? Theme.primary : Theme.error
+                            color: root._loginInProgress || root._hasCredentials ? Theme.primary : Theme.error
                             opacity: 0.6
+
+                            RotationAnimation on rotation {
+                                from: 0
+                                to: 360
+                                duration: 2000
+                                loops: Animation.Infinite
+                                running: root._hasCredentials && !root._loginInProgress && !root.dataAvailable
+                            }
                         }
 
                         Column {
@@ -867,16 +878,19 @@ PluginComponent {
 
                             StyledText {
                                 width: parent.width
-                                text: root._loginInProgress ? "Waiting for login..." : "Unable to load usage"
+                                text: root._loginInProgress ? "Waiting for login..."
+                                    : root._hasCredentials ? "Connecting..." : "Unable to load usage"
                                 font.pixelSize: Theme.fontSizeMedium
                                 font.weight: Font.Medium
-                                color: root._loginInProgress ? Theme.primary : Theme.error
+                                color: root._loginInProgress || root._hasCredentials ? Theme.primary : Theme.error
                                 horizontalAlignment: Text.AlignHCenter
                             }
 
                             StyledText {
                                 width: parent.width
-                                text: root._loginInProgress ? "Complete login in your browser" : (root.errorMessage || "Check your credentials")
+                                text: root._loginInProgress ? "Complete login in your browser"
+                                    : root._hasCredentials ? (root.errorMessage || "Fetching usage data...")
+                                    : (root.errorMessage || "Check your credentials")
                                 font.pixelSize: Theme.fontSizeSmall
                                 color: Theme.surfaceVariantText
                                 wrapMode: Text.WordWrap
@@ -885,7 +899,7 @@ PluginComponent {
                         }
 
                         MouseArea {
-                            visible: !root._loginInProgress && !root.loading
+                            visible: !root._loginInProgress && !root.loading && !root._hasCredentials
                             width: loginBtn.width
                             height: loginBtn.height
                             anchors.horizontalCenter: parent.horizontalCenter
