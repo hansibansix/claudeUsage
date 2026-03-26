@@ -14,7 +14,7 @@ PluginComponent {
 
     // === Constants ===
     readonly property string _oauthClientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    readonly property string _userAgent: "claude-code/2.0.32"
+    property string _userAgent: "claude-code/0.0.0"
     readonly property string _tokenEndpoint: "https://platform.claude.com/v1/oauth/token"
     readonly property string _authorizeEndpoint: "https://platform.claude.com/oauth/authorize"
     readonly property int _tokenRefreshBufferMs: 300000  // refresh 5 min before expiry (matches CLI)
@@ -27,8 +27,6 @@ PluginComponent {
         var planH = 70; // plan info card height
         if (showFiveHour) h += cardH;
         if (showSevenDay) h += cardH;
-        if (showOpus && sevenDayOpusUtil > 0) h += cardH;
-        if (showSonnet && sevenDaySonnetUtil > 0) h += cardH;
         if (showExtraUsage && extraUsageEnabled) h += cardH;
         if (showPlanInfo) h += planH;
         // Add spacing between cards
@@ -46,8 +44,6 @@ PluginComponent {
     property string displayMode: pluginData.displayMode || "5h"
     property bool showFiveHour: pluginData.showFiveHour !== false
     property bool showSevenDay: pluginData.showSevenDay !== false
-    property bool showOpus: pluginData.showOpus !== false
-    property bool showSonnet: pluginData.showSonnet !== false
     property bool showExtraUsage: pluginData.showExtraUsage !== false
     property bool showPlanInfo: pluginData.showPlanInfo !== false
 
@@ -98,14 +94,7 @@ PluginComponent {
     property string fiveHourReset: ""
     property real sevenDayUtil: 0
     property string sevenDayReset: ""
-    property real sevenDayOpusUtil: 0
-    property string sevenDayOpusReset: ""
-    property real sevenDaySonnetUtil: 0
-    property string sevenDaySonnetReset: ""
-
     property bool extraUsageEnabled: false
-    property real extraUsageLimit: 0
-    property real extraUsageUsed: 0
     property real extraUsageUtil: 0
 
     // === Pill helpers ===
@@ -129,7 +118,7 @@ PluginComponent {
             root._tick++;
             if (root.dataAvailable && !root._resetDetected) {
                 var now = Date.now();
-                var resets = [root.fiveHourReset, root.sevenDayReset, root.sevenDayOpusReset, root.sevenDaySonnetReset];
+                var resets = [root.fiveHourReset, root.sevenDayReset];
                 for (var i = 0; i < resets.length; i++) {
                     if (resets[i] && new Date(resets[i]).getTime() <= now) {
                         root._resetDetected = true;
@@ -141,10 +130,15 @@ PluginComponent {
         }
     }
 
-    // === Error helper ===
+    // === Error helpers ===
     function setError(msg) {
         errorMessage = msg;
         dataAvailable = false;
+        loading = false;
+    }
+
+    function setTransientError(msg) {
+        errorMessage = msg;
         loading = false;
     }
 
@@ -248,7 +242,8 @@ PluginComponent {
 
             if (exitCode !== 0 || !output) {
                 console.warn("[claudeUsage] Token refresh failed: exitCode=" + exitCode + " output=" + (output || "(empty)"));
-                root.setError("Token refresh failed\nRetrying...");
+                if (root.dataAvailable) root.setTransientError("Token refresh failed\nRetrying...");
+                else root.setError("Token refresh failed\nRetrying...");
                 root._resetDetected = false;
                 root.scheduleRetry();
                 output = "";
@@ -269,11 +264,14 @@ PluginComponent {
                         root._permanentAuthError = true;
                         root.setError("Session expired\nRun 'claude' to log in");
                     } else if (rateLimited) {
-                        root.setError("Rate limited\nRetrying...");
+                        if (root.dataAvailable) root.setTransientError("Rate limited\nRetrying...");
+                        else root.setError("Rate limited\nRetrying...");
                         root._resetDetected = false;
                         root.scheduleRetry();
                     } else {
-                        root.setError("Token refresh failed\n" + (errMsg || "Retrying..."));
+                        var msg = "Token refresh failed\n" + (errMsg || "Retrying...");
+                        if (root.dataAvailable) root.setTransientError(msg);
+                        else root.setError(msg);
                         root._resetDetected = false;
                         root.scheduleRetry();
                     }
@@ -282,7 +280,8 @@ PluginComponent {
                 }
                 if (!resp.access_token) {
                     console.warn("[claudeUsage] Token refresh: no access_token in response");
-                    root.setError("Token refresh failed\nRetrying...");
+                    if (root.dataAvailable) root.setTransientError("Token refresh failed\nRetrying...");
+                    else root.setError("Token refresh failed\nRetrying...");
                     root._resetDetected = false;
                     root.scheduleRetry();
                     output = "";
@@ -298,7 +297,8 @@ PluginComponent {
                 root.fetchUsage();
             } catch (e) {
                 console.warn("[claudeUsage] Token refresh parse error: " + e + " raw=" + output.substring(0, 200));
-                root.setError("Token refresh failed\nRetrying...");
+                if (root.dataAvailable) root.setTransientError("Token refresh failed\nRetrying...");
+                else root.setError("Token refresh failed\nRetrying...");
                 root._resetDetected = false;
                 root.scheduleRetry();
             }
@@ -649,12 +649,6 @@ PluginComponent {
         sevenDayUtil = sdUtil * 100;
         sevenDayReset = sdReset > 0 ? new Date(sdReset * 1000).toISOString() : "";
 
-        // No per-model breakdown in response headers
-        sevenDayOpusUtil = 0;
-        sevenDayOpusReset = "";
-        sevenDaySonnetUtil = 0;
-        sevenDaySonnetReset = "";
-
         if (ovUtil > 0 || ovReset > 0) {
             extraUsageEnabled = true;
             extraUsageUtil = ovUtil * 100;
@@ -691,9 +685,17 @@ PluginComponent {
             "-d '{\"model\":\"claude-haiku-4-5-20251001\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]}' " +
             "-w '%{http_code}' " +
             "'https://api.anthropic.com/v1/messages' 2>/dev/null); " +
-            "g() { grep -i \"^$1:\" \"$F\" 2>/dev/null | head -1 | sed 's/^[^:]*: *//' | tr -d '\\r\\n'; }; " +
-            "echo \"$C|$(g anthropic-ratelimit-unified-5h-utilization)|$(g anthropic-ratelimit-unified-5h-reset)|$(g anthropic-ratelimit-unified-7d-utilization)|$(g anthropic-ratelimit-unified-7d-reset)|$(g anthropic-ratelimit-unified-overage-utilization)|$(g anthropic-ratelimit-unified-overage-reset)|$(g retry-after)\"; " +
-            "rm -f \"$F\""
+            "R=$(awk 'BEGIN{IGNORECASE=1;FS=\": *\"} " +
+            "/^anthropic-ratelimit-unified-5h-utilization:/{a=$2} " +
+            "/^anthropic-ratelimit-unified-5h-reset:/{b=$2} " +
+            "/^anthropic-ratelimit-unified-7d-utilization:/{c=$2} " +
+            "/^anthropic-ratelimit-unified-7d-reset:/{d=$2} " +
+            "/^anthropic-ratelimit-unified-overage-utilization:/{e=$2} " +
+            "/^anthropic-ratelimit-unified-overage-reset:/{f=$2} " +
+            "/^retry-after:/{g=$2} " +
+            "END{gsub(/\\r/,\"\",a);gsub(/\\r/,\"\",b);gsub(/\\r/,\"\",c);gsub(/\\r/,\"\",d);gsub(/\\r/,\"\",e);gsub(/\\r/,\"\",f);gsub(/\\r/,\"\",g);" +
+            "printf \"%s|%s|%s|%s|%s|%s|%s\",a,b,c,d,e,f,g}' \"$F\"); " +
+            "echo \"$C|$R\"; rm -f \"$F\""
         ];
         usageFetcher.running = true;
     }
@@ -709,15 +711,42 @@ PluginComponent {
         running: true
         repeat: true
         onTriggered: {
-            // Don't interfere if we're in an error retry cycle or refreshing token
             if (root._permanentAuthError) return;
             if (refreshRetryTimer.running || root._refreshingToken) return;
             root._refreshRetries = 0;
-            root.loadUsage();
+            // Skip credential re-read if token is known valid and not near expiry
+            if (root.accessToken && root.expiresAt > 0
+                    && Date.now() < (root.expiresAt - root._tokenRefreshBufferMs)) {
+                root.fetchUsage();
+            } else {
+                root.loadUsage();
+            }
         }
     }
 
-    Component.onCompleted: root.loadUsage()
+    // === Detect installed Claude CLI version for user-agent ===
+    Process {
+        id: versionDetector
+        property string output: ""
+        command: ["claude", "--version"]
+        stdout: SplitParser {
+            onRead: line => {
+                if (!versionDetector.output) versionDetector.output = line.trim();
+            }
+        }
+        onExited: (exitCode) => {
+            if (exitCode === 0 && output) {
+                var m = output.match(/(\d+\.\d+\.\d+)/);
+                if (m) root._userAgent = "claude-code/" + m[1];
+            }
+            output = "";
+        }
+    }
+
+    Component.onCompleted: {
+        versionDetector.running = true;
+        root.loadUsage();
+    }
 
     // === Cleanup on destruction ===
     Component.onDestruction: {
@@ -958,26 +987,10 @@ PluginComponent {
                 }
 
                 UsageCard {
-                    visible: root.dataAvailable && root.showOpus && root.sevenDayOpusUtil > 0
-                    iconName: "auto_awesome"
-                    title: "Weekly Opus"
-                    subtitle: { root._tick; return Utils.formatResetDateTime(root.sevenDayOpusReset); }
-                    utilization: { root._tick; return Utils.effectiveUtilization(root.sevenDayOpusUtil, root.sevenDayOpusReset); }
-                }
-
-                UsageCard {
-                    visible: root.dataAvailable && root.showSonnet && root.sevenDaySonnetUtil > 0
-                    iconName: "bolt"
-                    title: "Weekly Sonnet"
-                    subtitle: { root._tick; return Utils.formatResetDateTime(root.sevenDaySonnetReset); }
-                    utilization: { root._tick; return Utils.effectiveUtilization(root.sevenDaySonnetUtil, root.sevenDaySonnetReset); }
-                }
-
-                UsageCard {
                     visible: root.dataAvailable && root.showExtraUsage && root.extraUsageEnabled
                     iconName: "payments"
                     title: "Extra Usage"
-                    subtitle: "$" + root.extraUsageUsed.toFixed(2) + " / $" + root.extraUsageLimit.toFixed(2)
+                    subtitle: Math.round(root.extraUsageUtil) + "% of spending limit used"
                     utilization: root.extraUsageUtil
                 }
 

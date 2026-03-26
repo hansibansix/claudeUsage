@@ -89,20 +89,6 @@ PluginSettings {
             }
 
             ToggleSetting {
-                settingKey: "showOpus"
-                label: "Weekly Opus"
-                description: "Show the Opus-specific weekly limit (when available)"
-                defaultValue: true
-            }
-
-            ToggleSetting {
-                settingKey: "showSonnet"
-                label: "Weekly Sonnet"
-                description: "Show the Sonnet-specific weekly limit (when available)"
-                defaultValue: true
-            }
-
-            ToggleSetting {
                 settingKey: "showExtraUsage"
                 label: "Extra Usage"
                 description: "Show the extra usage spending section"
@@ -187,7 +173,7 @@ PluginSettings {
             }
 
             StyledText {
-                text: "This widget fetches your real-time Claude plan usage from the Anthropic API using your Claude Code OAuth credentials (~/.claude/.credentials.json).\n\nUsage windows shown:\n\u2022 5-Hour — rolling rate limit window\n\u2022 Weekly — 7-day usage window\n\u2022 Weekly Opus — Opus-specific limit (if applicable)\n\u2022 Weekly Sonnet — Sonnet-specific limit (if applicable)\n\nThe icon and percentage are color-coded:\n\u2022 Green: < 50% used\n\u2022 Yellow: 50-80% used\n\u2022 Red: > 80% used\n\nToken refresh is handled automatically."
+                text: "This widget fetches your real-time Claude plan usage from the Anthropic API using your Claude Code OAuth credentials (~/.claude/.credentials.json).\n\nUsage windows shown:\n\u2022 5-Hour — rolling rate limit window\n\u2022 Weekly — 7-day usage window\n\nThe icon and percentage are color-coded:\n\u2022 Green: < 50% used\n\u2022 Yellow: 50-80% used\n\u2022 Red: > 80% used\n\nToken refresh is handled automatically."
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceVariantText
                 wrapMode: Text.WordWrap
